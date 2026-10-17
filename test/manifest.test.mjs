@@ -66,6 +66,18 @@ test('interactive: unknown targets, duplicate ids, bad end, unreachable warning'
   assert.ok(r.warnings.some((w) => /island: nothing leads here/.test(w)));
 });
 
+test('interactive: warns on a track with no end, not on one with end', () => {
+  const t = (id, extra = {}) => ({ id, title: id, match: id, icon: 'i.png', ...extra });
+  const dir = makeCard(tmpDir(), {
+    manifest: { title: 'T', tracks: [t('start', { left: 'cave', right: 'cave', end: 'repeat' }), t('cave')] },
+    audio: ['start.mp3', 'cave.mp3'], icons: { 'i.png': icon },
+  });
+  const r = checkCard(dir);
+  assert.deepEqual(r.errors, []);
+  assert.ok(r.warnings.some((w) => w === 'cave: no end set (use repeat at a choice, stop at an ending)'));
+  assert.ok(!r.warnings.some((w) => /^start: no end set/.test(w)));
+});
+
 test('missing playlist.json is an error', () => {
   const dir = tmpDir();
   assert.match(checkCard(dir).errors[0], /no playlist.json/);
