@@ -1,0 +1,6 @@
+{
+  "name": "custom-yoto-cards",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

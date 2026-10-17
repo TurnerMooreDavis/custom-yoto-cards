@@ -31,3 +31,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# card folders never live in this repo (recordings are private)
+cards/
