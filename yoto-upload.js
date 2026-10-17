@@ -1,335 +1,146 @@
 #!/usr/bin/env node
 /**
- * yoto-upload.js — create a Yoto MYO playlist from a local folder of mp3s + 16x16 icons.
+ * yoto-upload.js — build Yoto MYO playlists (linear or choose-your-own-adventure) from a card folder.
  *
- * Reads <folder>/playlist.json (title + ordered tracks), uploads each song's audio,
- * uploads its matching pixel-art icon, then creates one playlist where every song is a
- * chapter showing its own icon. Auth is OAuth2 Authorization-Code + PKCE via a one-time
- * browser sign-in; the refresh token is cached so later runs don't prompt again.
+ *   node yoto-upload.js login [--no-wait] [--paste <redirect-url>]   sign in once (token: ~/.config/yoto)
+ *   node yoto-upload.js logout
+ *   node yoto-upload.js prep <card>      raw/ memos -> clean/*.mp3 (trim silence, even loudness)
+ *   node yoto-upload.js check <card>     validate playlist.json, recordings, icons, branches
+ *   node yoto-upload.js upload <card>    check, then upload and create/update the playlist
+ *   node yoto-upload.js <card>           same as upload (upstream usage)
  *
- * Zero npm dependencies — uses Node 22 built-ins (http, crypto, fs) + global fetch/FormData/Blob.
- *
- * Setup (once):
- *   1. Create a PUBLIC client at https://dashboard.yoto.dev
- *   2. Register redirect URL:  http://127.0.0.1:8787/callback
- *   3. Put YOTO_CLIENT_ID=your_client_id in a .env file next to this script
- *      (or export it in your shell) — .env is auto-loaded and git-ignored.
- *
- * Usage:
- *   node yoto-upload.js [folder]          # default folder: $YOTO_PLAYLIST_DIR or my-playlist
- *   node yoto-upload.js --reset-auth      # force a fresh browser sign-in
+ * <card> is a folder path, or a folder name under $YOTO_CARDS_DIR.
+ * Client id: $YOTO_CLIENT_ID, else the first line of $YOTO_CLIENT_ID_FILE.
+ * Exit codes: 0 ok, 1 error, 3 not logged in. Zero npm dependencies.
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+import { configDir, startLogin, finishLogin, waitForLoopback, getAccessToken, logout, NotLoggedInError } from './lib/auth.mjs';
+import { checkCard, isInteractive } from './lib/manifest.mjs';
+import { buildContent } from './lib/build.mjs';
+import { prepCard } from './lib/prep.mjs';
+import { uploadAudio, uploadIcon, createContent } from './lib/yoto-api.mjs';
 
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
-const crypto = require('crypto');
-const { exec } = require('child_process');
+try { process.loadEnvFile(path.join(import.meta.dirname, '.env')); } catch { /* optional */ }
 
-// Auto-load .env from the repo root if present (Node 22 built-in, no dep).
-try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* no .env, fall back to real env */ }
-
-// ---- config ----
-const API = 'https://api.yotoplay.com';
-const LOGIN = 'https://login.yotoplay.com';
-const REDIRECT_URI = 'http://127.0.0.1:8787/callback';
-const REDIRECT_PORT = 8787;
-const SCOPE = 'user:content:manage offline_access'; // create content + upload icons + refresh
-const CLIENT_ID = process.env.YOTO_CLIENT_ID;
-const TOKEN_FILE = path.join(__dirname, '.yoto-token.json'); // cached refresh token — do not commit
-
-const args = process.argv.slice(2);
-const RESET_AUTH = args.includes('--reset-auth');
-const FOLDER = path.resolve(args.find((a) => !a.startsWith('--')) || process.env.YOTO_PLAYLIST_DIR || 'my-playlist');
-
-// ---- tiny helpers ----
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const log = (...a) => console.log(...a);
-const die = (msg) => { console.error('\n✖ ' + msg); process.exit(1); };
+class UsageError extends Error {}
 
-async function jsonOrThrow(res, label) {
-  if (!res.ok) {
-    let body = '';
-    try { body = await res.text(); } catch {}
-    throw new Error(`${label} failed: HTTP ${res.status} ${res.statusText}\n${body.slice(0, 500)}`);
+function clientId() {
+  if (process.env.YOTO_CLIENT_ID) return process.env.YOTO_CLIENT_ID.trim();
+  const f = process.env.YOTO_CLIENT_ID_FILE;
+  if (f && fs.existsSync(f)) return fs.readFileSync(f, 'utf8').split(/\r?\n/)[0].trim();
+  throw new UsageError('Set YOTO_CLIENT_ID (or YOTO_CLIENT_ID_FILE): create a Public client at https://dashboard.yoto.dev,\n  redirect http://127.0.0.1:8787/callback, scopes user:content:manage user:icons:manage offline_access (saved).');
+}
+
+function resolveCard(arg) {
+  if (!arg) throw new UsageError('Which card? Pass a folder path or a name under $YOTO_CARDS_DIR.');
+  if (fs.existsSync(arg) && fs.statSync(arg).isDirectory()) return path.resolve(arg);
+  const root = process.env.YOTO_CARDS_DIR;
+  if (root && fs.existsSync(path.join(root, arg))) return path.join(root, arg);
+  throw new UsageError(`no card folder "${arg}"${root ? ` (looked in ${root})` : ''}`);
+}
+
+function printPlan(r) {
+  log(`\nPlaylist: "${r.manifest?.title ?? '?'}"  (${r.tracks.length} tracks${isInteractive(r.manifest) ? ', interactive' : ''})`);
+  for (const t of r.tracks) {
+    const branch = [t.left && `left→${t.left}`, t.right && `right→${t.right}`, t.end && `end→${t.end}`].filter(Boolean).join(' ');
+    log(`  ${String(t.n).padStart(2)}. ${t.title}${t.id ? ` [${t.id}]` : ''}  ←  ${t.audioPath ? path.basename(t.audioPath) : '?'}${branch ? '   ' + branch : ''}`);
   }
-  return res.json();
+  for (const w of r.warnings) log(`  ⚠ ${w}`);
 }
 
-// ---- auth: refresh-token path, else browser PKCE ----
-function loadToken() {
-  try { return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')); } catch { return null; }
-}
-function saveToken(obj) {
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(obj, null, 2));
-}
-
-async function refreshAccessToken(refresh_token) {
-  const res = await fetch(`${LOGIN}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token }),
-  });
-  if (!res.ok) return null; // refresh expired/invalid → fall back to full login
-  const data = await res.json();
-  // refresh tokens are single-use; persist the new one
-  saveToken({ refresh_token: data.refresh_token || refresh_token });
-  return data.access_token;
+async function cmdLogin(flags) {
+  const id = clientId();
+  const dir = configDir();
+  if (flags.paste) { await finishLogin({ clientId: id, dir, redirectUrl: flags.paste }); log('✓ Logged in to Yoto.'); return; }
+  const url = startLogin({ clientId: id, dir });
+  log('\nOpen this URL in a browser and sign in to Yoto:\n\n' + url + '\n');
+  log('Afterwards the browser lands on a http://127.0.0.1:8787/callback?code=... page that may not load.');
+  if (flags.noWait) { log('Copy that address and run:  node yoto-upload.js login --paste \'<address>\''); return; }
+  log('Paste that address here (or, if this machine ran the browser, just wait):');
+  const rl = readline.createInterface({ input: process.stdin });
+  const pasted = new Promise((resolve) => rl.once('line', resolve));
+  const loopback = waitForLoopback({ timeoutMs: 30 * 60_000 }).then((code) => 'code=' + code).catch(() => new Promise(() => {}));
+  const redirectUrl = await Promise.race([pasted, loopback]);
+  rl.close();
+  await finishLogin({ clientId: id, dir, redirectUrl });
+  log('✓ Logged in to Yoto.');
+  process.exit(0); // the loopback server may still be listening
 }
 
-function waitForCallbackCode() {
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const u = new URL(req.url, `http://127.0.0.1:${REDIRECT_PORT}`);
-      if (u.pathname !== '/callback') { res.writeHead(404); return res.end(); }
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><body style="font:16px system-ui;padding:3rem;text-align:center">' +
-        '<h2>✅ Login complete</h2><p>You can close this tab and return to your terminal.</p></body></html>');
-      server.close();
-      const err = u.searchParams.get('error');
-      if (err) reject(new Error(`${err}: ${u.searchParams.get('error_description') || ''}`));
-      else resolve(u.searchParams.get('code'));
-    });
-    server.on('error', reject);
-    server.listen(REDIRECT_PORT, '127.0.0.1');
-  });
+function cmdCheck(card) {
+  const r = checkCard(card);
+  printPlan(r);
+  if (r.errors.length) { for (const e of r.errors) console.error(`  ✖ ${e}`); return r; }
+  log('\n✓ OK');
+  return r;
 }
 
-async function browserLogin() {
-  const code_verifier = b64url(crypto.randomBytes(32));
-  const code_challenge = b64url(crypto.createHash('sha256').update(code_verifier).digest());
-  const authUrl = new URL(`${LOGIN}/authorize`);
-  authUrl.search = new URLSearchParams({
-    audience: API,
-    scope: SCOPE,
-    response_type: 'code',
-    client_id: CLIENT_ID,
-    code_challenge,
-    code_challenge_method: 'S256',
-    redirect_uri: REDIRECT_URI,
-  }).toString();
-
-  const codePromise = waitForCallbackCode();
-  log('\nOpening your browser to sign in to Yoto…');
-  log('If it does not open, paste this URL manually:\n' + authUrl.toString() + '\n');
-  exec(`open "${authUrl.toString()}"`); // macOS
-
-  const code = await codePromise;
-  const res = await fetch(`${LOGIN}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: CLIENT_ID,
-      code_verifier,
-      code,
-      redirect_uri: REDIRECT_URI,
-    }),
-  });
-  const data = await jsonOrThrow(res, 'Token exchange');
-  saveToken({ refresh_token: data.refresh_token });
-  return data.access_token;
-}
-
-async function getAccessToken() {
-  if (RESET_AUTH) { try { fs.unlinkSync(TOKEN_FILE); } catch {} }
-  const saved = loadToken();
-  if (saved?.refresh_token) {
-    const tok = await refreshAccessToken(saved.refresh_token);
-    if (tok) { log('✓ Reused saved Yoto login (refreshed token)'); return tok; }
-    log('Saved login expired — signing in again…');
+async function cmdUpload(card) {
+  const r = checkCard(card);
+  printPlan(r);
+  if (r.errors.length) {
+    console.error('\n✖ fix these before uploading:');
+    for (const e of r.errors) console.error(`  ✖ ${e}`);
+    process.exit(1);
   }
-  return browserLogin();
-}
-
-// ---- Yoto media API ----
-async function uploadAudio(token, fileBuf, contentType) {
-  // 1. get a one-time upload URL
-  const got = await jsonOrThrow(
-    await fetch(`${API}/media/transcode/audio/uploadUrl`, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    }),
-    'Request upload URL'
-  );
-  const { uploadUrl, uploadId } = got.upload;
-  // 2. PUT the raw audio
-  const put = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': contentType },
-    body: new Blob([fileBuf], { type: contentType }),
-  });
-  if (!put.ok) throw new Error(`Audio PUT failed: HTTP ${put.status}`);
-  // 3. poll until transcoded
-  for (let i = 0; i < 120; i++) {
-    const res = await fetch(`${API}/media/upload/${uploadId}/transcoded?loudnorm=false`, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.transcode?.transcodedSha256) return data.transcode; // { transcodedSha256, transcodedInfo }
-    }
-    await sleep(1000);
+  const token = await getAccessToken({ clientId: clientId(), dir: configDir() });
+  const uploads = [];
+  for (const t of r.tracks) {
+    log(`\n[${t.n}/${r.tracks.length}] ${t.title}`);
+    log('   ↑ audio + transcoding…');
+    const transcode = await uploadAudio(token, t.audioPath);
+    log('   ↑ icon…');
+    const mediaId = await uploadIcon(token, t.iconPath, t.iconType);
+    uploads.push({ transcode, mediaId });
   }
-  throw new Error('Transcoding timed out');
+  const body = buildContent({ manifest: r.manifest, tracks: r.tracks, uploads, interactive: isInteractive(r.manifest) });
+  const existing = r.manifest.cardId || null;
+  log(existing ? `\nUpdating playlist ${existing}…` : '\nCreating playlist…');
+  const created = await createContent(token, body);
+  const newId = created.cardId || created.card?.cardId || created.contentId || null;
+  if (!existing && newId) saveCardId(r.manifestPath, newId);
+  log(`\n✅ ${existing ? 'Updated' : 'Created'} "${r.manifest.title}" (cardId ${existing || newId || 'see Yoto app'}).`);
+  log(existing ? 'A card already linked to it now plays the new version.' : 'Next: Yoto app → Library → this playlist → "Link to a card".');
 }
 
-async function uploadIcon(token, iconPath) {
-  const buf = fs.readFileSync(iconPath);
-  const name = path.basename(iconPath, path.extname(iconPath));
-  const url = `${API}/media/displayIcons/user/me/upload?autoConvert=true&filename=${encodeURIComponent(name)}`;
-  // API expects the raw binary image as the body (not multipart form-data)
-  const data = await jsonOrThrow(
-    await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'image/png' },
-      body: buf,
-    }),
-    'Icon upload'
-  );
-  return data.displayIcon.mediaId;
-}
-
-async function createContent(token, body) {
-  return jsonOrThrow(
-    await fetch(`${API}/content`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
-    'Create content'
-  );
-}
-
-// ---- persist a new cardId back into playlist.json, preserving its formatting ----
+// persist a new cardId into playlist.json, preserving its formatting (upstream behaviour)
 function saveCardId(manifestPath, cardId) {
   const raw = fs.readFileSync(manifestPath, 'utf8');
   const safe = String(cardId).replace(/"/g, '');
-  let next;
-  if (/"cardId"\s*:/.test(raw)) {
-    next = raw.replace(/"cardId"\s*:\s*(?:null|"[^"]*")/, `"cardId": "${safe}"`);
-  } else {
-    next = raw.replace(/^\s*{/, `{\n  "cardId": "${safe}",`); // inject as first field
-  }
+  const next = /"cardId"\s*:/.test(raw)
+    ? raw.replace(/"cardId"\s*:\s*(?:null|"[^"]*")/, `"cardId": "${safe}"`)
+    : raw.replace(/^\s*{/, `{\n  "cardId": "${safe}",`);
   fs.writeFileSync(manifestPath, next);
 }
 
-// ---- match an mp3 in the folder by a distinctive substring (NFC-normalized) ----
-function findMp3(files, match) {
-  const m = match.normalize('NFC').toLowerCase();
-  const hits = files.filter((f) => f.normalize('NFC').toLowerCase().includes(m));
-  if (hits.length === 0) throw new Error(`No mp3 matching "${match}"`);
-  if (hits.length > 1) throw new Error(`"${match}" matched ${hits.length} files: ${hits.join(', ')}`);
-  return hits[0];
+async function main() {
+  const argv = process.argv.slice(2);
+  const flags = { noWait: argv.includes('--no-wait'), resetAuth: argv.includes('--reset-auth') };
+  const pi = argv.indexOf('--paste');
+  if (pi >= 0) flags.paste = argv[pi + 1];
+  const pos = argv.filter((a, i) => !a.startsWith('--') && argv[i - 1] !== '--paste');
+  const [cmd, arg] = pos;
+  if (flags.resetAuth) logout(configDir());
+  switch (cmd) {
+    case 'login': return cmdLogin(flags);
+    case 'logout': logout(configDir()); return log('✓ Logged out.');
+    case 'prep': {
+      const res = await prepCard(resolveCard(arg));
+      return log(`✓ prep: ${res.done.length} cleaned, ${res.skipped.length} already up to date → clean/`);
+    }
+    case 'check': { const r = cmdCheck(resolveCard(arg)); if (r.errors.length) process.exit(1); return; }
+    case 'upload': return cmdUpload(resolveCard(arg));
+    case undefined:
+      if (flags.resetAuth) return cmdLogin(flags);
+      return cmdUpload(resolveCard(process.env.YOTO_PLAYLIST_DIR || 'my-playlist'));
+    default: return cmdUpload(resolveCard(cmd)); // upstream: node yoto-upload.js <folder>
+  }
 }
 
-// ---- derive a stable per-track chapter key from its title (not its array position) ----
-// The player caches downloaded chapter audio by key. If key were just the track's
-// position (as it used to be), adding/removing a track shifts everyone after it, so an
-// existing key gets reassigned to a *different* song — the player then serves its old
-// cached audio for that key until it happens to resync. Hashing the title keeps a given
-// track's key fixed across reorders/add/remove, so only genuinely new tracks get new keys.
-function stableKey(title, used) {
-  const hash = crypto.createHash('sha256').update(title).digest();
-  let n = hash[0] % 99;
-  let key = String(n + 1).padStart(2, '0');
-  for (let offset = 1; used.has(key); offset++) {
-    n = (n + hash[offset % hash.length] + offset) % 99;
-    key = String(n + 1).padStart(2, '0');
-  }
-  used.add(key);
-  return key;
-}
-
-// ---- main ----
-(async () => {
-  if (!CLIENT_ID) die('Set YOTO_CLIENT_ID first (create a public client at https://dashboard.yoto.dev,\n  register redirect http://127.0.0.1:8787/callback, then: export YOTO_CLIENT_ID=...).');
-
-  const manifestPath = path.join(FOLDER, 'playlist.json');
-  if (!fs.existsSync(manifestPath)) die(`No playlist.json in ${FOLDER}`);
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  const iconsDir = path.join(FOLDER, 'icons');
-  const mp3s = fs.readdirSync(FOLDER).filter((f) => f.toLowerCase().endsWith('.mp3'));
-
-  // resolve every track to a real audio + icon file up front, so we fail fast on typos
-  const usedKeys = new Set();
-  const plan = manifest.tracks.map((t, i) => {
-    const mp3 = findMp3(mp3s, t.match);
-    const icon = path.join(iconsDir, t.icon);
-    if (!fs.existsSync(icon)) throw new Error(`Missing icon: ${icon}`);
-    return { n: i + 1, title: t.title, key: stableKey(t.title, usedKeys), audioPath: path.join(FOLDER, mp3), iconPath: icon };
-  });
-
-  log(`\nPlaylist: "${manifest.title}"  (${plan.length} tracks)`);
-  plan.forEach((p) => log(`  ${String(p.n).padStart(2)}. ${p.title}  ←  ${path.basename(p.audioPath)}`));
-
-  const token = await getAccessToken();
-
-  const chapters = [];
-  let totalDuration = 0;
-  let totalFileSize = 0;
-
-  for (const p of plan) {
-    log(`\n[${p.n}/${plan.length}] ${p.title}`);
-    log('   ↑ uploading audio + transcoding…');
-    const tr = await uploadAudio(token, fs.readFileSync(p.audioPath), 'audio/mpeg');
-    const info = tr.transcodedInfo || {};
-    log('   ↑ uploading icon…');
-    const mediaId = await uploadIcon(token, p.iconPath);
-
-    const disp = { icon16x16: `yoto:#${mediaId}` };
-    chapters.push({
-      key: p.key,
-      title: p.title,
-      overlayLabel: String(p.n),
-      display: disp,
-      tracks: [{
-        key: '01',
-        title: p.title,
-        trackUrl: `yoto:#${tr.transcodedSha256}`,
-        type: 'audio',
-        format: info.format,
-        duration: info.duration,
-        fileSize: info.fileSize,
-        channels: info.channels,
-        overlayLabel: String(p.n),
-        display: disp,
-      }],
-    });
-    totalDuration += info.duration || 0;
-    totalFileSize += info.fileSize || 0;
-    log(`   ✓ done (${info.duration ? Math.round(info.duration) + 's' : '?'})`);
-  }
-
-  const existingCardId = manifest.cardId || null;
-  log(existingCardId ? `\nUpdating existing playlist (cardId ${existingCardId})…` : '\nCreating playlist…');
-  const created = await createContent(token, {
-    ...(existingCardId ? { cardId: existingCardId } : {}), // present → update that card, absent → create new
-    title: manifest.title,
-    content: { chapters },
-    metadata: {
-      media: {
-        duration: totalDuration,
-        fileSize: totalFileSize,
-        readableFileSize: Math.round((totalFileSize / 1024 / 1024) * 10) / 10,
-      },
-    },
-  });
-
-  const newCardId = created.cardId || created.card?.cardId || created.contentId || null;
-
-  if (existingCardId) {
-    log('\n✅ Playlist updated on your Yoto account.');
-    log(`   Title:  ${manifest.title}`);
-    log(`   cardId: ${existingCardId}`);
-    log('\nThe linked card now points at the updated content (no re-linking needed).');
-  } else {
-    if (newCardId) saveCardId(manifestPath, newCardId); // persist so future runs update, not duplicate
-    log('\n✅ Playlist created on your Yoto account.');
-    log(`   Title:  ${manifest.title}`);
-    log(`   cardId: ${newCardId || '(see Yoto app)'}`);
-    if (newCardId) log('   ↳ saved to playlist.json — re-running now updates this same playlist.');
-    log('\nNext: open the Yoto app → it appears in your library. To play it on a physical');
-    log('MYO card, open the playlist → "Link to a card" → tap your MYO card.');
-  }
-})().catch((e) => die(e.message || String(e)));
+main().catch((e) => {
+  console.error('\n✖ ' + (e.message || String(e)));
+  process.exit(e instanceof NotLoggedInError ? 3 : 1);
+});

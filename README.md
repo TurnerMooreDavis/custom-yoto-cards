@@ -136,7 +136,7 @@ a chapter that displays its own pixel art. **Zero npm dependencies** (Node 18+ b
 
 1. At [dashboard.yoto.dev](https://dashboard.yoto.dev), create a **Public** client.
 2. Register the redirect URL **exactly**: `http://127.0.0.1:8787/callback`
-3. Enable the scopes **`user:content:manage`** and **`offline_access`**, then save.
+3. Enable the scopes **user:content:manage**, **user:icons:manage** and **offline_access**, then save.
 4. Copy the **Client ID** and export it:
    ```bash
    export YOTO_CLIENT_ID=your_client_id
@@ -145,12 +145,16 @@ a chapter that displays its own pixel art. **Zero npm dependencies** (Node 18+ b
 ### Usage
 
 ```bash
-node yoto-upload.js example-playlist   # build / update the playlist in <folder>
-node yoto-upload.js --reset-auth       # force a fresh browser sign-in
+node yoto-upload.js login              # once: prints a sign-in URL; paste back the 127.0.0.1 address you land on
+node yoto-upload.js prep my-card       # raw/ memos -> clean/*.mp3 (needs ffmpeg)
+node yoto-upload.js check my-card      # validate before uploading
+node yoto-upload.js upload my-card     # (or: node yoto-upload.js my-card)
 ```
 
-The first run opens your browser to sign in to Yoto **once**; the refresh token is
-cached in `.yoto-token.json` (git-ignored) so later runs are silent.
+The login token is stored in `~/.config/yoto/token.json` (override with `YOTO_CONFIG_DIR`).
+Branching (choose-your-own-adventure) cards: give tracks an `id` plus `left` / `right`
+(track ids to jump to on the left/right button) and `end` (`stop`, `repeat` or a track id).
+See `docs/interactive-events.md`.
 
 A ready-to-copy template lives in [`example-playlist/`](example-playlist/): duplicate
 the folder, drop your `.mp3` files in it and your 16×16 PNG icons in `icons/`, then
