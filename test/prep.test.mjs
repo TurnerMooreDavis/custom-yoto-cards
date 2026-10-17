@@ -55,3 +55,28 @@ test('prepCard never leaves a partial clean/ file when ffmpeg dies mid-encode', 
   const ok = await prepCard(dir, { run: async (args) => fs.writeFileSync(args.at(-1), 'mp3') });
   assert.deepEqual(ok.done, ['memo.m4a']);
 });
+
+test('prepCard redoes a replaced source even when its mtime is older than the clean output', async () => {
+  const dir = makeCard(tmpDir(), { raw: ['cave.m4a'] });
+  const run = async (args) => fs.writeFileSync(args.at(-1), 'mp3');
+  await prepCard(dir, { run });
+  // a copy that keeps the original (older) Date modified
+  const old = new Date(Date.now() - 3 * 86400_000);
+  fs.writeFileSync(path.join(dir, 'raw', 'cave.m4a'), 'take 2');
+  fs.utimesSync(path.join(dir, 'raw', 'cave.m4a'), old, old);
+  const again = await prepCard(dir, { run });
+  assert.deepEqual(again.done, ['cave.m4a']);
+  // and the output now carries the source's mtime, so a further run skips
+  const third = await prepCard(dir, { run });
+  assert.deepEqual(third.skipped, ['cave.m4a']);
+});
+
+test('prepCard refuses same-stem sources and encodes nothing', async () => {
+  const dir = makeCard(tmpDir(), { raw: ['cave.m4a', 'cave.wav', 'river.m4a', 'river.mp3', 'solo.wav'] });
+  const calls = [];
+  const run = async (args) => { calls.push(args); fs.writeFileSync(args.at(-1), 'mp3'); };
+  await assert.rejects(prepCard(dir, { run }), (e) => e.message.includes('cave.m4a and cave.wav would both become clean/cave.mp3')
+    && e.message.includes('river.m4a and river.mp3 would both become clean/river.mp3'));
+  assert.equal(calls.length, 0);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'clean')), []);
+});
